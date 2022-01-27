@@ -5,12 +5,23 @@ import argparse
 
 from tqdm.auto import tqdm
 import pprint
+import subprocess
 
 import hashlib
 from datetime import datetime
 from nda_manifests import *
 
 import nibabel as nib
+
+
+# rel3_rawdata_vol4/sub-CC00558XX14/ses-164100
+#
+# B1 RepetitionTime = get volume time from Anthony
+#
+# # slice thickness?
+# # set slice timing to 0 for SVRs
+# # T1, T2 slice timing to 0
+
 
 DEFAULT_PARAMS = {
     'scanner_manufacturer_pd': "Philips Medical Systems",
@@ -29,7 +40,7 @@ DEFAULT_PARAMS = {
     'image_unit1': None,
     'image_resolution1': None,
     'image_slice_thickness': None,
-    'image_orientation': 'axial',
+    'image_orientation': 'Axial',
     'slice_timing': None,
     'image_extent2': None,
     'image_extent3': None,
@@ -62,6 +73,145 @@ d_MODALITY_MAINFILEPATTERN = {
 }
 
 
+class ManifestSplitter:
+    """ split manifest into submanifests with consistent scanner parameters specific to dHCP neo file naming and acquistion"""
+
+    def split(self, modality, manifest, *args, **kwargs):
+        if modality == 'anat':
+            return self.anat_split(manifest, *args, **kwargs)
+        elif modality == 'dwi':
+            return self.dwi_split(manifest, *args, **kwargs)
+        elif modality == 'func':
+            return self.func_split(manifest, *args, **kwargs)
+        elif modality == 'B1':
+            return self.b1_split(manifest, *args, **kwargs)
+        elif modality == 'fmap':
+            return self.fmap_split(manifest, *args, **kwargs)
+
+    @staticmethod
+    def check_accountedfor(d_submodal_manifest, files, modality):
+        accountedfor = []
+        notaccountedfor = []
+        for v in d_submodal_manifest.values():
+            for _v in v:
+                if _v in accountedfor:
+                    print('file accounted for in multiple sub-manifests!', _v['file'])
+            accountedfor += v
+
+        notaccountedfor += [p for p in files if p not in accountedfor]
+
+        if notaccountedfor:
+            d_submodal_manifest[modality+'-unknown'] = notaccountedfor
+            print('WARNING: change splitting rules? unaccounted for files:\n' + '\n'.join([f['path'] for f in notaccountedfor]))
+
+    @staticmethod
+    def finalise(d_submodal_manifest, d_submodal_mainimagestem):
+        for k in d_submodal_manifest.keys():
+            d_submodal_manifest[k] = {'files':d_submodal_manifest[k]}
+            if k not in d_submodal_mainimagestem:
+                print('d_submodal_mainimagestem:', d_submodal_mainimagestem)
+                raise IOError(' '.join(map(str, ['missing file stem for modality', k,
+                                                 'in manifest', d_submodal_manifest[k]])))
+
+
+    def fmap_split(self, manifest):
+        files = [f for f in manifest['files']]
+        d_submodal_manifest = {}
+        d_submodal_mainimagestem = {}
+
+        for what in ['magnitude', 'epi']:
+            self.get_run_by_pattern(what, files, 'fmap', d_submodal_manifest, d_submodal_mainimagestem)
+
+        self.check_accountedfor(d_submodal_manifest, files, 'fmap')
+        self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
+        return d_submodal_manifest, d_submodal_mainimagestem
+
+
+    def b1_split(self, manifest):
+        files = [f for f in manifest['files']]
+        d_submodal_manifest = {}
+        d_submodal_mainimagestem = {}
+
+        for what in ['magnitude']:
+            self.get_run_by_pattern(what, files, 'B1', d_submodal_manifest, d_submodal_mainimagestem)
+
+        self.check_accountedfor(d_submodal_manifest, files, 'B1')
+        self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
+        return d_submodal_manifest, d_submodal_mainimagestem
+
+
+    def func_split(self, manifest):
+        files = [f for f in manifest['files']]
+        d_submodal_manifest = {}
+        d_submodal_mainimagestem = {}
+
+        for what in ['task-rest_sbref', 'task-rest_bold', 'task-rest_sbref']:
+            self.get_run_by_pattern(what, files, 'func', d_submodal_manifest, d_submodal_mainimagestem)
+
+        self.check_accountedfor(d_submodal_manifest, files, 'func')
+        self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
+        return d_submodal_manifest, d_submodal_mainimagestem
+
+    def dwi_split(self, manifest):
+        files = [f for f in manifest['files']]
+        d_submodal_manifest = {}
+        d_submodal_mainimagestem = {}
+
+        for what in ['sbref', 'dwi']:
+            self.get_run_by_pattern(what, files, 'dwi', d_submodal_manifest, d_submodal_mainimagestem)
+
+        # add old recon from release 2
+        for k in d_submodal_manifest:
+            if k.startswith('dwi-dwi'):
+                d_submodal_manifest[k]  += [p for p in files if 'rec-release2_dwi' in p['path']]
+
+        self.check_accountedfor(d_submodal_manifest, files, 'dwi')
+        self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
+        return d_submodal_manifest, d_submodal_mainimagestem
+
+    @staticmethod
+    def get_run_by_pattern(what, files, modality, d_submodal_manifest, d_submodal_mainimagestem):
+        pattern = re.compile(f'.*(_run-\d\d_){what}.json$')
+        for p in files:
+            if pattern.match(p['path']):
+                run = pattern.search(p['path']).group(1)
+                newpattern = re.compile('.*'+run+'.*')
+                key = f'{modality}-{what}-'+run.rstrip('_').lstrip('_')
+                d_submodal_manifest[key] = [f for f in files if newpattern.match(f['path'])]
+                d_submodal_mainimagestem[key] = p['path'][:-len('.json')]
+
+
+    def anat_split(self, manifest):
+        files = [f for f in manifest['files']]
+        d_submodal_manifest = {}
+        d_submodal_mainimagestem = {}
+
+        d_submodal_manifest['anat-T1svr'] = [p for p in files if 'SVR_T1w' in p['path']]
+        for f in d_submodal_manifest['anat-T1svr']:
+            if f['path'].endswith('SVR_T1w.json'):
+                d_submodal_mainimagestem['anat-T1svr'] = f['path'][:-len('.json')]
+                break
+        d_submodal_manifest['anat-T2svr'] = [p for p in files if 'SVR_T2w' in p['path']]
+        for f in d_submodal_manifest['anat-T2svr']:
+            if f['path'].endswith('SVR_T2w.json'):
+                d_submodal_mainimagestem['anat-T2svr'] = f['path'][:-len('.json')]
+                break
+        d_submodal_manifest['anat-mprage'] = [p for p in files if 'MPRAGE' in p['path']]
+        for f in d_submodal_manifest['anat-mprage']:
+            if f['path'].endswith('MPRAGE_T1w.json'):
+                d_submodal_mainimagestem['anat-mprage'] = f['path'][:-len('.json')]
+                break
+        # get individual "runs"
+        for what in ['T1w', 'T2w']:
+            self.get_run_by_pattern(what, files, 'anat', d_submodal_manifest, d_submodal_mainimagestem)
+
+        self.check_accountedfor(d_submodal_manifest, files, 'anat')
+        self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
+        return d_submodal_manifest, d_submodal_mainimagestem
+
+
+
+
 def filter_stem(modal, d_imagestem_suffixes):
     """ get main image file for modality `modal` to parse json and header details from """
 
@@ -74,79 +224,131 @@ def filter_stem(modal, d_imagestem_suffixes):
             return stem
 
 
+
 class ImageMetadataParser:
     def __init__(self):
-        self.image_suffixes = ['.nii.gz', '.nii', '.json']
-
-    def get_image_data(self, manifest):
-        d_image_suf = {}
-        for p in manifest['files']:
-            p = p['path']
-            for suf in self.image_suffixes:
-                if p.endswith(suf):
-                    stem = p[:-len(suf)]
-                    if stem not in d_image_suf:
-                        d_image_suf[stem] = []
-                    d_image_suf[stem] += [suf]
-                    break
-        return d_image_suf
+        self.image_suffixes = ['.nii.gz', '.nii']
 
 
-    def get_image_parameters(self, modal, manifest):
+    def cosine_to_orientation(iop):
+        import numpy as np
+        """Deduce slicing from cosines
+
+        From bids2nda tool
+        From http://nipy.org/nibabel/dicom/dicom_orientation.html#dicom-voxel-to
+        -patient-coordinate-system-mapping
+
+        From Section C.7.6.1.1.1 we see that the "positive row axis" is left to
+        right, and is the direction of the rows, given by the direction of last
+        pixel in the first row from the first pixel in that row. Similarly the
+        "positive column axis" is top to bottom and is the direction of the columns,
+        given by the direction of the last pixel in the first column from the first
+        pixel in that column.
+
+        Let's rephrase: the first three values of "Image Orientation Patient" are
+        the direction cosine for the "positive row axis". That is, they express the
+        direction change in (x, y, z), in the DICOM patient coordinate system
+        (DPCS), as you move along the row. That is, as you move from one column to
+        the next. That is, as the column array index changes. Similarly, the second
+        triplet of values of "Image Orientation Patient" (img_ornt_pat[3:] in
+        Python), are the direction cosine for the "positive column axis", and
+        express the direction you move, in the DPCS, as you move from row to row,
+        and therefore as the row index changes.
+
+        Parameters
+        ----------
+        iop: list of float
+           Values of the ImageOrientationPatient field
+
+        Returns
+        -------
+        {'Axial', 'Coronal', 'Sagittal'}
+        """
+        # Solution based on https://stackoverflow.com/a/45469577
+        iop_round = np.round(iop)
+        plane = np.cross(iop_round[0:3], iop_round[3:6])
+        plane = np.abs(plane)
+        if plane[0] == 1:
+            return "Sagittal"
+        elif plane[1] == 1:
+            return "Coronal"
+        elif plane[2] == 1:
+            return "Axial"
+        else:
+            raise RuntimeError(
+                "Could not deduce the image orientation of %r. 'plane' value is %r"
+                % (iop, plane)
+            )
+
+    def get_image_parameters(self, modal, filestem):
         params = {k:v for k, v in DEFAULT_PARAMS.items()}
-
-        d_image_suf = self.get_image_data(manifest)
-        stem = filter_stem(modal, d_image_suf)
-        print(stem)
-        assert stem is not None, f'modality {modal} has no image files in {sorted(d_image_suf.keys())}'
-        suffs = d_image_suf[stem]
+        stem = str(filestem)
+        suffs = [suf for suf in self.image_suffixes if os.path.isfile(filestem+suf)]
+        if not len(suffs) == 1:
+            raise IOError('no image found for: ' + stem)
+        image_suffix = suffs[0]
         # parse json
         js = {}
-        if '.json' in suffs:
+        if os.path.isfile(stem+'.json'):
             with open(stem+'.json', 'r') as f:
                 js = json.load(f)
             for pk, jk in d_PARAMKEY_JSONKEY.items():
                 if jk in js:
                     params[pk] = js[jk]
-            if js.get('AcqVoxelSize', None) is not None:
-                params['image_slice_thickness'] = js['AcqVoxelSize'][2] #assumes image_orientation == axial
 
-        missing = {k:v for k, v in params.items() if v is None}
         # parse image header
-        if missing:
-            ext = None
-            for suf in suffs:
-                if '.nii' in suf:
-                    ext = suf
-                    break
-            if ext is None:
-                raise IOError(str(stem)+' is missing .nii image: '+str(suffs))
-            img = nib.load(stem + ext)
-            voxel_grid = img.header.get_data_shape()
-            voxel_res = img.header.get_zooms()
-            units = img.header.get_xyzt_units()
-            fov = []
-            for dim, (size, res) in enumerate(zip(voxel_grid, voxel_res), 1):
-                params[f'image_extent{dim}'] = size
-                params[f'image_resolution{dim}'] = res
-                fov.append(size*res)
-                if dim <= 3:
-                    if units[0] == 'unknown':
-                        params[f'image_unit{dim}'] = 'Millimeters'
-                    else:
-                        params[f'image_unit{dim}'] = units[0]
-            params['acquisition_matrix'] = list(voxel_grid[:2])
-            if params.get('image_slice_thickness', None) is not None and params['image_slice_thickness'] != voxel_res[2]:
-                print(f"using AcqVoxelSize {params['image_slice_thickness']}, not image voxel size {voxel_res[2]} for slice thickness")
-            else:
-                print(f"using image voxel size {voxel_res[2]} for slice thickness")
-                params['image_slice_thickness'] = voxel_res[2]
-            params['image_num_dimensions'] = dim
-            params['mri_field_of_view_pd'] = fov[:3]
+        img = nib.load(stem + image_suffix)
+        voxel_grid = img.header.get_data_shape()
+        voxel_res = img.header.get_zooms()
+        units = img.header.get_xyzt_units()
+
+        # TODO replace this hack, properly parse image_orientation --> slice_dimension
+        orientation = None
+        iop = js.get('ImageOrientationPatient', None)
+        if iop is not None:
+            orientation = self.cosine_to_orientation(iop)
+        if orientation is None:
+            if (stem.endswith('T1w') or stem.endswith('T2w')) and 'SVR' not in modal and not 'mprage' in modal: # try to infer using MRtrix3 image strides, does not generalise
+                stride = subprocess.check_output(['mrinfo', stem + image_suffix, '-stride']).decode('utf8').split()
+                if stride[:3] == ['3', '2', '-1']:
+                    orientation = 'Axial'
+                elif stride[:3] == ['2', '-1', '3']:
+                    orientation = 'Sagittal'
+                else:
+                    print('warning: stride', stride, 'not recognized, assuming axial for', stem)
+                    orientation = 'Axial'
+            else: # here we just assume axial and hope for the best
+                orientation = 'Axial'
+        slice_dim = {'Axial':2, 'Sagittal':0, 'Coronal':1}.get(orientation)
+        params['image_orientation'] = orientation
+
+        fov = []
+        for dim, (size, res) in enumerate(zip(voxel_grid, voxel_res), 1):
+            params[f'image_extent{dim}'] = size
+            params[f'image_resolution{dim}'] = res
+            fov.append(size*res)
+            if dim <= 3:
+                if units[0] == 'unknown' or units[0] == 'mm':
+                    params[f'image_unit{dim}'] = 'Millimeters'
+                else:
+                    params[f'image_unit{dim}'] = units[0]
+        params['acquisition_matrix'] = [voxel_grid[d] for d in range(3) if d != slice_dim or 'mprage' in modal]
+        params['image_num_dimensions'] = dim
+        params['mri_field_of_view_pd'] = fov[:3]
+
+        # extract slice thickness from json and NIFTI, apply rules if in disagreement
+        if js.get('AcqVoxelSize', None) is not None:
+            params['image_slice_thickness'] = js['AcqVoxelSize'][slice_dim] #assumes image_orientation == axial
+        if params.get('image_slice_thickness', None) is not None and abs(params['image_slice_thickness'] - voxel_res[slice_dim]) > 1e-4:
+            print(f"{stem}: using image voxel size {voxel_res[slice_dim]} for slice thickness, not AcqVoxelSize {params['image_slice_thickness']}")
+        params['image_slice_thickness'] = voxel_res[slice_dim]
+
+        if modal.startswith('B1'):
+            params['mri_repetition_time_pd'] = 0
 
         missing = {k:v for k, v in params.items() if v is None}
-        if missing:
-            print('missing parameters:\n'+pprint.pformat(missing))
+        #         if missing:
+        #             print('missing parameters:\n'+pprint.pformat(missing))
 
         return params
 
@@ -156,14 +358,14 @@ class Image03Gen:
                  d_sub_guid,
                  d_subses_gascan,
                  d_subses_sex,
-                 image03_template,
+                 d_subses_interviewdate,
                  image03_definitions
                  ):
         self.d_sub_guid = d_sub_guid
         self.d_subses_gascan = d_subses_gascan
         self.d_subses_sex = d_subses_sex
+        self.d_subses_interviewdate = d_subses_interviewdate
 
-        self.df_template = pd.read_csv(image03_template)
         self.df_definitions = pd.read_csv(image03_definitions)
 
         self.required = self.df_definitions.loc[self.df_definitions.Required == 'Required', :]
@@ -199,7 +401,10 @@ class Image03Gen:
 
     def make_row(self, sub, ses, **kwargs):
         subses = f"{sub}-{ses}"
-        defaults = {'transformation_performed':'No', 'image_file_format':'NIFTI', 'scan_object':'Live', 'image_modality':'MRI'}
+        defaults = {'transformation_performed':'No', # if Yes: 'transformation_type':'BIDS2NDA' or similar
+                    'image_file_format':'NIFTI',
+                    'scan_object':'Live',
+                    'image_modality':'MRI'}
         defaults.update(kwargs)
         image03_row = {}
         for _, row in self.required.iterrows():
@@ -216,7 +421,10 @@ class Image03Gen:
                     val = self.ga_to_months(self.d_subses_gascan.get(subses))
             elif element == 'interview_date':
                 val = defaults.get(element, None)
+                if val is None:
+                    val = self.d_subses_interviewdate.get(subses, None)
                 if val is None: # make up random but reproducible date
+                    self.warn(f'making up interview date for {subses}')
                     val = self.str_to_random_date(subses)
             else:
                 val = defaults.get(element, None)
@@ -264,10 +472,12 @@ class RawParser:
     data on disk:
     rel3_derivatives/rel3_rawdata_vol?/sub-*/ses-*/<modality>/file tree
     caches manifest files in `manifest_dir`
+
+    TODO: include json and tsv files in top level directory
     """
     def __init__(self, toplevel, manifest_dir, only_subject=None):
         self.manifests = {}
-        pbar = tqdm([d for d in self.listdirs(toplevel) if d.startswith('sub-')])
+        pbar = tqdm([d for d in self.listdirs(toplevel) if d.startswith('sub-')], desc="parsing raw data")
         for sub in pbar:
 
             if only_subject is not None and sub != only_subject:
@@ -276,7 +486,6 @@ class RawParser:
             session_ids = pd.read_csv(toplevel / sub / f'{sub}_sessions.tsv' , delimiter='\t')['session_id'].values.tolist()
             sessions = [f'ses-{ses}' for ses in session_ids]
             # TODO make sure subfolders match sessions
-
             for ses in sessions:
                 for modality in self.listdirs(toplevel / sub / ses):
                     input_dir = toplevel / sub / ses / modality
@@ -321,8 +530,11 @@ if __name__ == '__main__':
     image03_template = 'templates/image03_template.csv'
     image03_definitions = 'templates/image03_definitions.csv'
 
+    # _________________________ parse dHCP metadata _____________________
     url = 'https://raw.githubusercontent.com/BioMedIA/dHCP-release-notes/master/supplementary_files/combined.tsv'
     df_neo = pd.read_csv(url, sep='\t')
+
+    # session GA at scan and subject sex
     d_subses_gascan = {}
     d_subses_sex = {}
     for _, row in df_neo.iterrows():
@@ -331,6 +543,7 @@ if __name__ == '__main__':
         d_subses_gascan[sub+'-'+ses] = row['scan_age']
         d_subses_sex[sub+'-'+ses] = {'male':'M', 'female':'F'}.get(row['sex'])
 
+    # subject to guid mapping
     d_sub_guid = {}
     with open('dhcp/GUID_mapping_all', 'r') as f:
         for l in f.readlines():
@@ -344,6 +557,13 @@ if __name__ == '__main__':
                     sub = 'sub-' + sub
                 d_sub_guid[sub] = guid
 
+    # get scan date
+    df_scandates = pd.read_csv('dhcp/DHCPNDH1-GUIDS_Randomised_DateOfScanAndSa_DATA_2021-11-19_1316.csv')
+    # df_scandates = df_scandates.loc[df_scandates.guid.astype(str).str.startswith('NDA'), :]
+    df_scandates = df_scandates[~df_scandates.ses.isna() & ~df_scandates.scan_appt_date.isna()]
+    df_scandates['subses'] = 'sub-'+df_scandates.participationid + '-' + 'ses-'+df_scandates.ses.astype(int).astype(str)
+    df_scandates['interview_date'] = df_scandates.scan_appt_date.apply(lambda x: f"{x.split('/')[1]}/{x.split('/')[0]}/{x.split('/')[2]}")
+    d_subses_interviewdate = {row['subses']:row['interview_date'] for _, row in df_scandates.iterrows()}
 
     manifest_dir = Path('manifests')
 
@@ -358,16 +578,45 @@ if __name__ == '__main__':
     image03 = Image03Gen(d_sub_guid,
                          d_subses_gascan=d_subses_gascan,
                          d_subses_sex=d_subses_sex,
-                         image03_template=image03_template,
+                         d_subses_interviewdate=d_subses_interviewdate,
                          image03_definitions=image03_definitions)
 
-
+    # _________________________ parse dHCP image data _____________________
     toplevel = Path(args.input_dir)
+
+    # check completeness
+    datadir = toplevel
+    while datadir.name not in ['rel3_derivatives']:
+        if datadir == datadir.parent:
+            datadir = None
+            break
+        datadir = datadir.parent
+
+    if datadir is not None:
+        subses_dirlist = sorted(datadir.glob('rel3_rawdata_vol?/sub-*/ses-*'))
+        subses4release = set(p.parent.name+'-'+p.name for p in subses_dirlist)
+
+        for subses in sorted(subses4release):
+            if subses not in d_subses_interviewdate:
+                print('no interview date for', subses)
+            if subses not in d_subses_gascan:
+                print('no GA scan data for', subses)
+            if subses not in d_subses_sex:
+                print('no sex for', subses)
+
+        _subses = set(d_subses_gascan).union(set(d_subses_sex)) # not d_subses_interviewdate
+        for subses in sorted(_subses - subses4release):
+            print('image data for', subses, 'not released?')
+        print('sub-ses check done')
 
     raw = RawParser(toplevel, manifest_dir)
 
-    for (sub, ses, modality, input_dir, manifest_json), manifest in raw.manifests.items():
-        print(input_dir)
+    # _________________________ parse image metadata data _____________________
+
+    image_parser = ImageMetadataParser()
+    manisplit = ManifestSplitter()
+
+    for (sub, ses, modality, input_dir, manifest_json), manifest in tqdm(raw.manifests.items(), desc="parsing image metadata data"):
         # check if all files are accounted for
         all_files = []
         for path, subdirs, files in os.walk(input_dir):
@@ -386,5 +635,10 @@ if __name__ == '__main__':
             kwargs['bvek_bval_files'] = 'Yes'
         elif 'fMRI' == scan_type:
             kwargs['experiment_id'] = '1942'
+
+        # for modal, stem in d_submodal_mainimagestem.items():
+        #     imdata = {'_modality': modal, '_main_image': stem}
+        #     imdata.update(image_parser.get_image_parameters(modal, stem))
+
         rows += [image03.make_row(sub, ses, scan_type=scan_type, image_description='reconstructed raw data in BIDS format', **kwargs)]
 
