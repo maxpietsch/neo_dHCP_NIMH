@@ -14,19 +14,10 @@ from nda_manifests import *
 import nibabel as nib
 
 
-# rel3_rawdata_vol4/sub-CC00558XX14/ses-164100
-#
-# B1 RepetitionTime = get volume time from Anthony
-#
-# # slice thickness?
-# # set slice timing to 0 for SVRs
-# # T1, T2 slice timing to 0
-
-
 DEFAULT_PARAMS = {
     'scanner_manufacturer_pd': "Philips Medical Systems",
     'scanner_type_pd': "Achieva",
-    'scanner_software_versions_pd': "3.2.2\3.2.2.0",
+    'scanner_software_versions_pd': "3.2.2/3.2.2.0/dHCP",
     'magnetic_field_strength': 3,
     'mri_repetition_time_pd': None,
     'mri_echo_time_pd': None,
@@ -60,16 +51,6 @@ d_PARAMKEY_JSONKEY = {
     'mri_echo_time_pd': "EchoTime",
     'flip_angle': "FlipAngle",
     'slice_timing': "SliceTiming",
-}
-
-
-d_MODALITY_MAINFILEPATTERN = {
-    'func': '_task-rest_bold',
-    'B1': '_magnitude',
-    'anat-T2': 'rec-SVR_T2w',
-    'anat-T1': 'rec-SVR_T1w',
-    'dwi': re.compile('.*_run-\d\d_dwi$'),
-    'fmap': '_magnitude'
 }
 
 
@@ -160,10 +141,11 @@ class ManifestSplitter:
         for what in ['sbref', 'dwi']:
             self.get_run_by_pattern(what, files, 'dwi', d_submodal_manifest, d_submodal_mainimagestem)
 
-        # add old recon from release 2
-        for k in d_submodal_manifest:
+        # add old recon from release 2, does not have a json but has different image resolution
+        for k in list(d_submodal_manifest.keys()):
             if k.startswith('dwi-dwi'):
-                d_submodal_manifest[k]  += [p for p in files if 'rec-release2_dwi' in p['path']]
+                d_submodal_manifest['dwi-dwiRelease2']  = [p for p in files if 'rec-release2_dwi' in p['path']]
+                d_submodal_mainimagestem['dwi-dwiRelease2'] = os.path.splitext(d_submodal_manifest['dwi-dwiRelease2'][0]['path'])[0]
 
         self.check_accountedfor(d_submodal_manifest, files, 'dwi')
         self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
@@ -208,20 +190,6 @@ class ManifestSplitter:
         self.check_accountedfor(d_submodal_manifest, files, 'anat')
         self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
         return d_submodal_manifest, d_submodal_mainimagestem
-
-
-
-
-def filter_stem(modal, d_imagestem_suffixes):
-    """ get main image file for modality `modal` to parse json and header details from """
-
-    assert modal in d_MODALITY_MAINFILEPATTERN, modal
-    for stem in sorted(d_imagestem_suffixes):
-        pattern = d_MODALITY_MAINFILEPATTERN[modal]
-        if isinstance(pattern, str) and stem.endswith(pattern):
-            return stem
-        elif isinstance(pattern, re.Pattern) and pattern.match(stem):
-            return stem
 
 
 
@@ -280,6 +248,23 @@ class ImageMetadataParser:
                 % (iop, plane)
             )
 
+    def overwrite_image_parameters(self, modal, filestem, params):
+        # fixes wrong or adds missing stuff after get_image_parameters
+        if modal.startswith('B1-'):
+            params['image_resolution4'] = 4.8
+        elif modal.startswith('fmap-magnitude'):
+            params['image_resolution4'] = 20.2
+        elif modal.endswith('dwiRelease2'):
+            params['slice_timing'] = [0, 2.6125, 1.425, 0.2375, 2.85, 1.6625, 0.475, 3.0875, 1.9, 0.7125, 3.325, 2.1375, 0.95, 3.5625, 2.375, 1.1875, 0, 2.6125,
+                                      1.425, 0.2375, 2.85, 1.6625, 0.475, 3.0875, 1.9, 0.7125, 3.325, 2.1375, 0.95, 3.5625, 2.375, 1.1875, 0, 2.6125, 1.425,
+                                      0.2375, 2.85, 1.6625, 0.475, 3.0875, 1.9, 0.7125, 3.325, 2.1375, 0.95, 3.5625, 2.375, 1.1875, 0, 2.6125, 1.425, 0.2375,
+                                        2.85, 1.6625, 0.475, 3.0875, 1.9, 0.7125, 3.325, 2.1375, 0.95, 3.5625, 2.375, 1.1875]
+        params['scanner_software_versions_pd'] = DEFAULT_PARAMS['scanner_software_versions_pd']
+        if params.get('slice_timing', None) is None:
+            params['slice_timing'] = [0]
+
+
+
     def get_image_parameters(self, modal, filestem):
         params = {k:v for k, v in DEFAULT_PARAMS.items()}
         stem = str(filestem)
@@ -308,16 +293,18 @@ class ImageMetadataParser:
         if iop is not None:
             orientation = self.cosine_to_orientation(iop)
         if orientation is None:
-            if (stem.endswith('T1w') or stem.endswith('T2w')) and 'SVR' not in modal and not 'mprage' in modal: # try to infer using MRtrix3 image strides, does not generalise
+            if (stem.endswith('T1w') or stem.endswith('T2w')) and 'svr' not in modal.lower() and not 'mprage' in modal: # try to infer using MRtrix3 image strides, does not generalise
                 stride = subprocess.check_output(['mrinfo', stem + image_suffix, '-stride']).decode('utf8').split()
                 if stride[:3] == ['3', '2', '-1']:
-                    orientation = 'Axial'
-                elif stride[:3] == ['2', '-1', '3']:
                     orientation = 'Sagittal'
+                elif stride[:3] == ['2', '-1', '3']:
+                    orientation = 'Axial'
                 else:
                     print('warning: stride', stride, 'not recognized, assuming axial for', stem)
                     orientation = 'Axial'
-            else: # here we just assume axial and hope for the best
+            elif 'mprage' in modal:
+                orientation = 'Sagittal'
+            else: # here we just assume axial and hope for the best
                 orientation = 'Axial'
         slice_dim = {'Axial':2, 'Sagittal':0, 'Coronal':1}.get(orientation)
         params['image_orientation'] = orientation
@@ -349,6 +336,8 @@ class ImageMetadataParser:
         missing = {k:v for k, v in params.items() if v is None}
         #         if missing:
         #             print('missing parameters:\n'+pprint.pformat(missing))
+
+        self.overwrite_image_parameters(modal, filestem, params)
 
         return params
 
