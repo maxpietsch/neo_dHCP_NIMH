@@ -12,7 +12,7 @@ from datetime import datetime
 from nda_manifests import *
 
 import nibabel as nib
-
+from nibabel.orientations import io_orientation, axcodes2ornt, ornt_transform
 
 DEFAULT_PARAMS = {
     'scanner_manufacturer_pd': "Philips Medical Systems",
@@ -306,7 +306,11 @@ class ImageMetadataParser:
                 orientation = 'Sagittal'
             else: # here we just assume axial and hope for the best
                 orientation = 'Axial'
-        slice_dim = {'Axial':2, 'Sagittal':0, 'Coronal':1}.get(orientation)
+        # figure out coordinate permutation to RAS coordinate system
+        img_ornt = io_orientation(img.affine)
+        to_RAS = ornt_transform(img_ornt, axcodes2ornt("RAS"))
+        d_niidim2RASdim = {i:j for i, j in zip(range(3), to_RAS[:,0].astype(int))}
+        slice_dim = d_niidim2RASdim[{'Axial':2, 'Sagittal':0, 'Coronal':1}.get(orientation)]
         params['image_orientation'] = orientation
 
         fov = []
