@@ -2,6 +2,7 @@ import os, json, sys, re
 import pandas as pd
 from pathlib import Path
 import argparse
+import csv
 
 from tqdm.auto import tqdm
 import pprint
@@ -54,6 +55,12 @@ d_PARAMKEY_JSONKEY = {
 }
 
 
+def write_csv(dataframe, csv_path, header='"image", "03"\n'):
+    with open(csv_path, 'w') as f:
+        f.write(header)
+    dataframe.to_csv(csv_path, index=False, mode='a', quoting=csv.QUOTE_ALL)
+
+
 class ManifestSplitter:
     """ split manifest into submanifests with consistent scanner parameters specific to dHCP neo file naming and acquistion"""
 
@@ -90,7 +97,6 @@ class ManifestSplitter:
         for k in d_submodal_manifest.keys():
             d_submodal_manifest[k] = {'files':d_submodal_manifest[k]}
             if k not in d_submodal_mainimagestem:
-                print('d_submodal_mainimagestem:', d_submodal_mainimagestem)
                 raise IOError(' '.join(map(str, ['missing file stem for modality', k,
                                                  'in manifest', d_submodal_manifest[k]])))
 
@@ -259,6 +265,9 @@ class ImageMetadataParser:
                                       1.425, 0.2375, 2.85, 1.6625, 0.475, 3.0875, 1.9, 0.7125, 3.325, 2.1375, 0.95, 3.5625, 2.375, 1.1875, 0, 2.6125, 1.425,
                                       0.2375, 2.85, 1.6625, 0.475, 3.0875, 1.9, 0.7125, 3.325, 2.1375, 0.95, 3.5625, 2.375, 1.1875, 0, 2.6125, 1.425, 0.2375,
                                         2.85, 1.6625, 0.475, 3.0875, 1.9, 0.7125, 3.325, 2.1375, 0.95, 3.5625, 2.375, 1.1875]
+            params['mri_echo_time_pd'] = 0.09
+            params['flip_angle'] = 90
+            params['mri_repetition_time_pd'] = 3.8
         params['scanner_software_versions_pd'] = DEFAULT_PARAMS['scanner_software_versions_pd']
         if params.get('slice_timing', None) is None:
             params['slice_timing'] = [0]
@@ -300,7 +309,7 @@ class ImageMetadataParser:
                 elif stride[:3] == ['2', '-1', '3']:
                     orientation = 'Axial'
                 else:
-                    print('warning: stride', stride, 'not recognized, assuming axial for', stem)
+                    self.warn('warning: stride', stride, 'not recognized, assuming axial for', stem)
                     orientation = 'Axial'
             elif 'mprage' in modal:
                 orientation = 'Sagittal'
@@ -323,23 +332,28 @@ class ImageMetadataParser:
                     params[f'image_unit{dim}'] = 'Millimeters'
                 else:
                     params[f'image_unit{dim}'] = units[0]
+        if dim == 4: # TODO generalise to higher dims?
+            params[f'image_unit{dim}'] = 'Seconds' # TODO parse
+            params[f'image_extent{dim}'] = voxel_grid[3]
+            params[f'extent{dim}_type'] = 'volumes'
+
         params['acquisition_matrix'] = [voxel_grid[d] for d in range(3) if d != slice_dim or 'mprage' in modal]
         params['image_num_dimensions'] = dim
-        params['mri_field_of_view_pd'] = fov[:3]
+        params['mri_field_of_view_pd'] = [round(fv, 2) for fv in fov[:3]]
 
         # extract slice thickness from json and NIFTI, apply rules if in disagreement
         if js.get('AcqVoxelSize', None) is not None:
             params['image_slice_thickness'] = js['AcqVoxelSize'][slice_dim] #assumes image_orientation == axial
         if params.get('image_slice_thickness', None) is not None and abs(params['image_slice_thickness'] - voxel_res[slice_dim]) > 1e-4:
-            print(f"{stem}: using image voxel size {voxel_res[slice_dim]} for slice thickness, not AcqVoxelSize {params['image_slice_thickness']}")
+            self.info(f"{stem}: using image voxel size {voxel_res[slice_dim]} for slice thickness, not AcqVoxelSize {params['image_slice_thickness']}")
         params['image_slice_thickness'] = voxel_res[slice_dim]
 
         if modal.startswith('B1'):
             params['mri_repetition_time_pd'] = 0
 
-        missing = {k:v for k, v in params.items() if v is None}
-        #         if missing:
-        #             print('missing parameters:\n'+pprint.pformat(missing))
+        # missing = {k:v for k, v in params.items() if v is None}
+        # if missing:
+        #     print('missing parameters:\n'+pprint.pformat(missing))
 
         self.overwrite_image_parameters(modal, filestem, params)
 
@@ -352,7 +366,8 @@ class Image03Gen:
                  d_subses_gascan,
                  d_subses_sex,
                  d_subses_interviewdate,
-                 image03_definitions
+                 image03_definitions,
+                 verbose=False
                  ):
         self.d_sub_guid = d_sub_guid
         self.d_subses_gascan = d_subses_gascan
@@ -366,6 +381,8 @@ class Image03Gen:
 
         self.Hash = hashlib.sha512
         self.MAX_HASH_PLUS_ONE = 2**(self.Hash().digest_size * 8)
+
+        self.verbose = verbose
 
     @staticmethod
     def ga_to_months(ga_weeks):
@@ -391,6 +408,11 @@ class Image03Gen:
     @staticmethod
     def warn(*args, **kwargs):
         print(*args, **kwargs)
+
+    @staticmethod
+    def info(*args, **kwargs):
+        if self.verbose:
+            print(*args, **kwargs)
 
     def make_row(self, sub, ses, **kwargs):
         subses = f"{sub}-{ses}"
@@ -506,11 +528,20 @@ class RawParser:
 
 def load_args():
     parser = argparse.ArgumentParser(description='Create a Manifest Files and Image03 from a directory ')
-    parser.add_argument('-id', '--input-dir', help='A directory as input, to create Manifest Files from.')
+    parser.add_argument('-id', '--input_dir', help='A directory as input, to create Manifest Files from.')
+    parser.add_argument('-out', '--csv_out', help='Write image03.csv to path.')
+    parser.add_argument('--manifest_dir', default='manifests', help='output and cache directory for manifest files')
     args = parser.parse_args()
 
     if args.input_dir is None:
         parser.error('No input dir specified')
+
+    if args.csv_out is None:
+        print('writing no output')
+    else:
+        print('writing csv output to ', args.csv_out)
+
+    print('manifest dir:', args.manifest_dir)
     return args
 
 
@@ -558,15 +589,12 @@ if __name__ == '__main__':
     df_scandates['interview_date'] = df_scandates.scan_appt_date.apply(lambda x: f"{x.split('/')[1]}/{x.split('/')[0]}/{x.split('/')[2]}")
     d_subses_interviewdate = {row['subses']:row['interview_date'] for _, row in df_scandates.iterrows()}
 
-    manifest_dir = Path('manifests')
-
     d_modality_scantype = {'anat': 'MR structural (T1, T2)',
                            'B1': 'MR structural (B1 map)',
                            'dwi': 'MR diffusion',
                            'fmap': 'Field Map',
                            'func': 'fMRI'
                            }
-    rows = []
 
     image03 = Image03Gen(d_sub_guid,
                          d_subses_gascan=d_subses_gascan,
@@ -574,7 +602,10 @@ if __name__ == '__main__':
                          d_subses_interviewdate=d_subses_interviewdate,
                          image03_definitions=image03_definitions)
 
-    # _________________________ parse dHCP image data _____________________
+    manifest_dir = Path(args.manifest_dir)
+    os.makedirs(manifest_dir, exist_ok=True)
+
+    # _________________________ parse dHCP raw images, make modality-specific manifests _____________________
     toplevel = Path(args.input_dir)
 
     # check completeness
@@ -604,11 +635,11 @@ if __name__ == '__main__':
 
     raw = RawParser(toplevel, manifest_dir)
 
-    # _________________________ parse image metadata data _____________________
+    # _________________________ parse image metadata _____________________
 
     image_parser = ImageMetadataParser()
     manisplit = ManifestSplitter()
-
+    csv_rows = []
     for (sub, ses, modality, input_dir, manifest_json), manifest in tqdm(raw.manifests.items(), desc="parsing image metadata data"):
         # check if all files are accounted for
         all_files = []
@@ -622,6 +653,7 @@ if __name__ == '__main__':
         assert len(all_files - manifest_files) == 0
         assert len(manifest_files - all_files) == 0
 
+        # subject and session and other general metadata
         scan_type = d_modality_scantype.get(modality, modality)
         kwargs = {'manifest': manifest_json}
         if 'diffusion' in scan_type:
@@ -629,9 +661,31 @@ if __name__ == '__main__':
         elif 'fMRI' == scan_type:
             kwargs['experiment_id'] = '1942'
 
-        # for modal, stem in d_submodal_mainimagestem.items():
-        #     imdata = {'_modality': modal, '_main_image': stem}
-        #     imdata.update(image_parser.get_image_parameters(modal, stem))
+        row = image03.make_row(sub, ses, scan_type=scan_type, image_description='reconstructed raw data in BIDS format', **kwargs)
 
-        rows += [image03.make_row(sub, ses, scan_type=scan_type, image_description='reconstructed raw data in BIDS format', **kwargs)]
+        # split manifest by scan, parse main image in each scan to fill in image properties fields
+        d_submodal_manifest, d_submodal_mainimagestem = manisplit.split(modality, manifest)
+        # pprint.pprint({k:[p['path'] for p in v['files']] for k, v in d_submodal_manifest.items()})
+        for modal, stem in d_submodal_mainimagestem.items():
+            submanifest = d_submodal_manifest[modal]
+
+            # write submanifest
+            json_path = manifest_dir / f'submanifest_{sub}_{ses}_raw{modal}.json'
+            with open(json_path, 'w') as f:
+                f.write(json.dumps(submanifest))
+
+            imdata = {'_modality': modal, '_main_image': stem}
+            imdata.update(image_parser.get_image_parameters(modal, stem))
+            imdata.update(row)
+            imdata['manifest'] = str(json_path)
+            csv_rows += [imdata]
+
+    # _________________________ write image03 _____________________
+    if args.csv_out:
+        df_image03 = pd.DataFrame(csv_rows)
+        # remove debug columns
+        df_image03 = df_image03.reindex([c for c in sorted(df_image03.columns) if not c.startswith('_')], axis=1)
+        # prevent error image_extent4: The field provided was not an integer.
+        df_image03.image_extent4 = df_image03.image_extent4.apply(lambda x: str(int(x)) if isinstance(x, float) and not np.isnan(x) else x)
+        write_csv(df_image03, args.csv_out)
 
