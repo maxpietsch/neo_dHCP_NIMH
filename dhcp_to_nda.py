@@ -3,6 +3,7 @@ import pandas as pd
 from pathlib import Path
 import argparse
 import csv
+import numpy as np
 
 from tqdm.auto import tqdm
 import pprint
@@ -14,6 +15,41 @@ from nda_manifests import *
 
 import nibabel as nib
 from nibabel.orientations import io_orientation, axcodes2ornt, ornt_transform
+
+IMAGE_EXTENSIONS = ['.nii.gz', '.nii']
+
+
+FILE_BLACKLIST = [
+    # TODO: missing files in anat?
+    'sub-CC00555XX11_ses-162400_rec-SVR_T1w.json',
+    'sub-CC00555XX11_ses-162400_run-06_T2w.json',
+    'sub-CC00555XX11_ses-162400_run-06_rec-mc_T2w.json',
+    'sub-CC00555XX11_ses-162400_run-06_rec-mcsr_T2w.json',
+    'sub-CC00555XX11_ses-162400_run-08_T2w.json',
+    'sub-CC00555XX11_ses-162400_run-08_rec-mc_T2w.json',
+    'sub-CC00555XX11_ses-162400_run-08_rec-mcsr_T2w.json',
+    'sub-CC00555XX11_ses-162400_run-15_T2w.json',
+    'sub-CC00555XX11_ses-162400_run-15_rec-mc_T2w.json',
+    'sub-CC00555XX11_ses-162400_run-15_rec-mcsr_T2w.json',
+    'sub-CC00555XX11_ses-162400_run-17_T1w.json',
+    'sub-CC00555XX11_ses-162400_run-17_rec-mc_T1w.json',
+    'sub-CC00555XX11_ses-162400_run-17_rec-mcsr_T1w.json',
+    'sub-CC00555XX11_ses-162400_run-18_T1w.json',
+    'sub-CC00555XX11_ses-162400_run-18_rec-mc_T1w.json',
+    'sub-CC00555XX11_ses-162400_run-18_rec-mcsr_T1w.json',
+    'sub-CC00555XX11_ses-162400_rec-SVR_T2w.json',
+    'sub-CC00555XX11_ses-162400_run-07_acq-MPRAGE_T1w.json',
+
+    'sub-CC00769XX19_ses-6410_rec-SVR_T1w.json',
+    'sub-CC00769XX19_ses-6410_run-09_rec-mcsr_T1w.json',
+    'sub-CC00769XX19_ses-6410_run-09_rec-mc_T1w.json',
+    'sub-CC00769XX19_ses-6410_run-09_T1w.json',
+    'sub-CC00769XX19_ses-6410_run-10_rec-mcsr_T1w.json',
+    'sub-CC00769XX19_ses-6410_run-10_rec-mc_T1w.json',
+    'sub-CC00769XX19_ses-6410_run-10_T1w.json',
+    'sub-CC00769XX19_ses-6410_run-11_rec-mcsr_T1w.json',
+    'sub-CC00769XX19_ses-6410_run-11_rec-mc_T1w.json',
+    'sub-CC00769XX19_ses-6410_run-11_T1w.json',]
 
 DEFAULT_PARAMS = {
     'scanner_manufacturer_pd': "Philips Medical Systems",
@@ -77,28 +113,40 @@ class ManifestSplitter:
             return self.fmap_split(manifest, *args, **kwargs)
 
     @staticmethod
-    def check_accountedfor(d_submodal_manifest, files, modality):
+    def check_accountedfor(d_submodal_manifest, files, modality, manifest=None):
         accountedfor = []
         notaccountedfor = []
         for v in d_submodal_manifest.values():
             for _v in v:
                 if _v in accountedfor:
-                    print('file accounted for in multiple sub-manifests!', _v['file'])
+                    print('WARNING: file accounted for in multiple sub-manifests!', _v['file'])
             accountedfor += v
 
         notaccountedfor += [p for p in files if p not in accountedfor]
 
         if notaccountedfor:
-            d_submodal_manifest[modality+'-unknown'] = notaccountedfor
-            print('WARNING: change splitting rules? unaccounted for files:\n' + '\n'.join([f['path'] for f in notaccountedfor]))
+            d_submodal_manifest[modality+'-notaccountedfor'] = notaccountedfor
+            print('WARNING: change splitting rules? unaccounted for files:\n' + '\n'.join([f['path'] for f in notaccountedfor]),
+                  f'full manifest: {manifest}' if manifest is not None else '')
 
     @staticmethod
-    def finalise(d_submodal_manifest, d_submodal_mainimagestem):
+    def finalise(d_submodal_manifest, d_submodal_mainimagestem, manifest=None):
+        delete_keys = [ ]
         for k in d_submodal_manifest.keys():
-            d_submodal_manifest[k] = {'files':d_submodal_manifest[k]}
+            if len(d_submodal_manifest[k]) == 0:
+                delete_keys += [k]
+                continue
+
+            d_submodal_manifest[k] = {'files': d_submodal_manifest[k]}
             if k not in d_submodal_mainimagestem:
                 raise IOError(' '.join(map(str, ['missing file stem for modality', k,
-                                                 'in manifest', d_submodal_manifest[k]])))
+                                                 'in manifest', d_submodal_manifest[k],
+                                                 f'manifest: {manifest}' if manifest is not None else '']))
+                              )
+        for k in delete_keys:
+            del d_submodal_manifest[k]
+            if k in d_submodal_mainimagestem:
+                del d_submodal_mainimagestem[k]
 
 
     def fmap_split(self, manifest):
@@ -109,8 +157,8 @@ class ManifestSplitter:
         for what in ['magnitude', 'epi']:
             self.get_run_by_pattern(what, files, 'fmap', d_submodal_manifest, d_submodal_mainimagestem)
 
-        self.check_accountedfor(d_submodal_manifest, files, 'fmap')
-        self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
+        self.check_accountedfor(d_submodal_manifest, files, 'fmap', manifest=manifest)
+        self.finalise(d_submodal_manifest, d_submodal_mainimagestem, manifest)
         return d_submodal_manifest, d_submodal_mainimagestem
 
 
@@ -122,8 +170,8 @@ class ManifestSplitter:
         for what in ['magnitude']:
             self.get_run_by_pattern(what, files, 'B1', d_submodal_manifest, d_submodal_mainimagestem)
 
-        self.check_accountedfor(d_submodal_manifest, files, 'B1')
-        self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
+        self.check_accountedfor(d_submodal_manifest, files, 'B1', manifest=manifest)
+        self.finalise(d_submodal_manifest, d_submodal_mainimagestem, manifest)
         return d_submodal_manifest, d_submodal_mainimagestem
 
 
@@ -135,8 +183,8 @@ class ManifestSplitter:
         for what in ['task-rest_sbref', 'task-rest_bold', 'task-rest_sbref']:
             self.get_run_by_pattern(what, files, 'func', d_submodal_manifest, d_submodal_mainimagestem)
 
-        self.check_accountedfor(d_submodal_manifest, files, 'func')
-        self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
+        self.check_accountedfor(d_submodal_manifest, files, 'func', manifest=manifest)
+        self.finalise(d_submodal_manifest, d_submodal_mainimagestem, manifest)
         return d_submodal_manifest, d_submodal_mainimagestem
 
     def dwi_split(self, manifest):
@@ -148,20 +196,26 @@ class ManifestSplitter:
             self.get_run_by_pattern(what, files, 'dwi', d_submodal_manifest, d_submodal_mainimagestem)
 
         # add old recon from release 2, does not have a json but has different image resolution
-        for k in list(d_submodal_manifest.keys()):
-            if k.startswith('dwi-dwi'):
-                d_submodal_manifest['dwi-dwiRelease2']  = [p for p in files if 'rec-release2_dwi' in p['path']]
-                d_submodal_mainimagestem['dwi-dwiRelease2'] = os.path.splitext(d_submodal_manifest['dwi-dwiRelease2'][0]['path'])[0]
+        # i.e. sub-CC00514XX11_ses-151400_rec-release2_dwi.nii
+        rel2dwi = [p for p in files if 'rec-release2_dwi' in p['path']]
+        if rel2dwi:
+            d_submodal_manifest['dwi-dwiRelease2']  = rel2dwi
+            d_submodal_mainimagestem['dwi-dwiRelease2'] = os.path.splitext(d_submodal_manifest['dwi-dwiRelease2'][0]['path'])[0]
 
-        self.check_accountedfor(d_submodal_manifest, files, 'dwi')
-        self.finalise(d_submodal_manifest, d_submodal_mainimagestem)
+        self.check_accountedfor(d_submodal_manifest, files, 'dwi', manifest=manifest)
+        self.finalise(d_submodal_manifest, d_submodal_mainimagestem, manifest)
         return d_submodal_manifest, d_submodal_mainimagestem
 
     @staticmethod
     def get_run_by_pattern(what, files, modality, d_submodal_manifest, d_submodal_mainimagestem):
+        # look for json. only use if associated image is found. extract run. find all files from same run
         pattern = re.compile(f'.*(_run-\d\d_){what}.json$')
+        imagepattern = re.compile(f'.*(_run-\d\d_){what}(' + '|'.join([re.escape(e) for e in IMAGE_EXTENSIONS]) +')$')
         for p in files:
             if pattern.match(p['path']):
+                if not any(imagepattern.match(q['path']) for q in files):
+                    print("WARNING: no images found for", p['path'], 'ignoring item')
+                    continue
                 run = pattern.search(p['path']).group(1)
                 newpattern = re.compile('.*'+run+'.*')
                 key = f'{modality}-{what}-'+run.rstrip('_').lstrip('_')
@@ -201,8 +255,12 @@ class ManifestSplitter:
 
 class ImageMetadataParser:
     def __init__(self):
-        self.image_suffixes = ['.nii.gz', '.nii']
+        self.image_suffixes = IMAGE_EXTENSIONS
+        self.verbose = False
 
+    def info(self, *args, **kwargs):
+        if self.verbose:
+            print(*args, **kwargs)
 
     def cosine_to_orientation(iop):
         import numpy as np
@@ -490,20 +548,28 @@ class RawParser:
 
     TODO: include json and tsv files in top level directory
     """
-    def __init__(self, toplevel, manifest_dir, only_subject=None):
+    def __init__(self, toplevel, manifest_dir, only_subject=None, blacklist=FILE_BLACKLIST):
         self.manifests = {}
+        self.file_blacklist = set(blacklist)
+
         pbar = tqdm([d for d in self.listdirs(toplevel) if d.startswith('sub-')], desc="parsing raw data")
         for sub in pbar:
-
             if only_subject is not None and sub != only_subject:
                 continue
 
             session_ids = pd.read_csv(toplevel / sub / f'{sub}_sessions.tsv' , delimiter='\t')['session_id'].values.tolist()
-            sessions = [f'ses-{ses}' for ses in session_ids]
-            # TODO make sure subfolders match sessions
+            sessions = sorted([f'ses-{ses}' for ses in session_ids])
+            session_dirs = sorted([d.name for d in list((toplevel / sub).glob('ses-*')) if os.path.isdir(d)])
+            if sessions != session_dirs:
+                print("WARNING: sessions " + str(sessions) + " from " + str(toplevel / sub / f'{sub}_sessions.tsv') +
+                              " do not match session folders:" + str(session_dirs) + ". Using all.")
+                sessions = sorted(set(session_dirs + sessions))
+
             for ses in sessions:
                 for modality in self.listdirs(toplevel / sub / ses):
                     input_dir = toplevel / sub / ses / modality
+                    if not os.path.isdir(input_dir):
+                        continue
                     manifest_json = manifest_dir / f'{sub}-{ses}_raw{modality}.json'
                     if not os.path.isfile(manifest_json):
                         pbar.set_description(f"Processing {manifest_json}")
@@ -511,8 +577,10 @@ class RawParser:
                         manifest.output_as_file(manifest_dir / f'{sub}-{ses}_raw{modality}.json')
                     with open(manifest_json, 'r') as f:
                         manifest = json.load(f)
-                        self.manifests[(sub, ses, modality, input_dir, manifest_json)] = manifest
-
+                        manifest['files'] = [f for f in manifest['files'] if os.path.split(f['path'])[1] not in self.file_blacklist]
+                        if len(manifest['files']) > 0:
+                            self.manifests[(sub, ses, modality, input_dir, manifest_json)] = manifest
+            # assert not 'CC01116AN11' in sub, {k: v for k, v in self.manifests.items() if k[0]==sub}
     @staticmethod
     def make_manifest(input_dir):
         manifest = Manifest()
@@ -535,6 +603,7 @@ def load_args():
 
     if args.input_dir is None:
         parser.error('No input dir specified')
+    print('input dir:', args.input_dir)
 
     if args.csv_out is None:
         print('writing no output')
@@ -605,19 +674,20 @@ if __name__ == '__main__':
     manifest_dir = Path(args.manifest_dir)
     os.makedirs(manifest_dir, exist_ok=True)
 
-    # _________________________ parse dHCP raw images, make modality-specific manifests _____________________
     toplevel = Path(args.input_dir)
 
-    # check completeness
-    datadir = toplevel
-    while datadir.name not in ['rel3_derivatives']:
-        if datadir == datadir.parent:
-            datadir = None
-            break
-        datadir = datadir.parent
+    # _________________________ check completeness of cohort metadata _____________________
 
-    if datadir is not None:
-        subses_dirlist = sorted(datadir.glob('rel3_rawdata_vol?/sub-*/ses-*'))
+    data_root_dir = toplevel
+    while data_root_dir.name not in ['rel3_derivatives']:
+        if data_root_dir == data_root_dir.parent:
+            data_root_dir = None
+            break
+        data_root_dir = data_root_dir.parent
+
+    if data_root_dir is not None:
+        print('looking for subjects and sessions in data root dir:', data_root_dir)
+        subses_dirlist = sorted(data_root_dir.glob('rel3_rawdata_vol?/sub-*/ses-*'))
         subses4release = set(p.parent.name+'-'+p.name for p in subses_dirlist)
 
         for subses in sorted(subses4release):
@@ -633,12 +703,15 @@ if __name__ == '__main__':
             print('image data for', subses, 'not released?')
         print('sub-ses check done')
 
+    # _________________________ parse dHCP raw images, make modality-specific manifests _____________________
+
     raw = RawParser(toplevel, manifest_dir)
 
-    # _________________________ parse image metadata _____________________
+    # _________________________ parse image metadata, split manifests into coherent submanifests _____________________
 
     image_parser = ImageMetadataParser()
     manisplit = ManifestSplitter()
+
     csv_rows = []
     for (sub, ses, modality, input_dir, manifest_json), manifest in tqdm(raw.manifests.items(), desc="parsing image metadata data"):
         # check if all files are accounted for
@@ -649,7 +722,7 @@ if __name__ == '__main__':
                 if os.path.isfile(f):
                     all_files.append(Path(f).absolute())
         manifest_files = set([Path(f['path']).absolute() for f in manifest['files']])
-        all_files = set(all_files)
+        all_files = set([f for f in all_files if f.name not in set(FILE_BLACKLIST)])
         assert len(all_files - manifest_files) == 0
         assert len(manifest_files - all_files) == 0
 
@@ -684,8 +757,12 @@ if __name__ == '__main__':
     if args.csv_out:
         df_image03 = pd.DataFrame(csv_rows)
         # remove debug columns
-        df_image03 = df_image03.reindex([c for c in sorted(df_image03.columns) if not c.startswith('_')], axis=1)
+        df_image03_out = df_image03.reindex([c for c in sorted(df_image03.columns) if not c.startswith('_')], axis=1)
         # prevent error image_extent4: The field provided was not an integer.
-        df_image03.image_extent4 = df_image03.image_extent4.apply(lambda x: str(int(x)) if isinstance(x, float) and not np.isnan(x) else x)
-        write_csv(df_image03, args.csv_out)
+        df_image03_out.image_extent4 = df_image03_out.image_extent4.apply(lambda x: str(int(x)) if isinstance(x, float) and not np.isnan(x) else x)
+        write_csv(df_image03_out, args.csv_out)
+
+        df_image03_debug = df_image03.reindex([c for c in sorted(df_image03.columns)], axis=1)
+        df_image03_debug.to_csv(str(args.csv_out)[:-len('.csv')]+'_debug.csv', index=False)
+
 
