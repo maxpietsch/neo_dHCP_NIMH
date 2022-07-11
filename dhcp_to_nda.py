@@ -599,6 +599,7 @@ def load_args():
     parser.add_argument('-id', '--input_dir', help='A directory as input, to create Manifest Files from.')
     parser.add_argument('-out', '--csv_out', help='Write image03.csv to path.')
     parser.add_argument('--manifest_dir', default='manifests', help='output and cache directory for manifest files')
+    parser.add_argument('--physlog', action='store_true', help='only write physlogs associated with bold data, ignore other modalities (for post-hock upload)')
     args = parser.parse_args()
 
     if args.input_dir is None:
@@ -749,9 +750,43 @@ if __name__ == '__main__':
 
             imdata = {'_modality': modal, '_main_image': stem}
             imdata.update(image_parser.get_image_parameters(modal, stem))
+
+            # hack to add physlogs to bold fMRI data via separate manifests
+            if modal.startswith('func') and 'bold' in modal:
+                # if sub == 'sub-CC00063AN06' and ses == 'ses-15102':
+                #     print(sub, ses, stem, submanifest)
+
+                physlog = Path(args.input_dir).parent / 'rel3_sourcedata' / sub / ses / 'func'
+                fname = Path(stem).name.replace('task-rest_bold', 'task-rest_physio.log')
+                physlog = physlog / fname
+                # .glob(f'{sub}_{ses}_run-*_task-rest_physio.log'))
+                if not os.path.isfile(physlog):
+                    print("WARNING: manifest missing for %s" % row)
+                    continue
+
+                physlog_json_path = manifest_dir / f'submanifest_{sub}_{ses}_raw{fname}.json'
+
+                if True or not os.path.isfile(physlog_json_path):
+                    manifest = Manifest()
+                    manifest.files.append(ManifestRecord(str(physlog)))
+                    manifest.output_as_file(physlog_json_path)
+
+                imdata.update(row)
+                imdata['manifest'] = str(physlog_json_path)
+                csv_rows += [imdata]
+
+            if args.physlog: # hack to add physlog: ignore everything else as already uploaded
+                continue
+
+                #     physlog = str(physlog[0].relative_to(Path(args.input_dir).parent))
+                #     row['data_file2'] = physlog
+                # else:
+                #     continue
+
             imdata.update(row)
             imdata['manifest'] = str(json_path)
             csv_rows += [imdata]
+
 
     # _________________________ write image03 _____________________
     if args.csv_out:
